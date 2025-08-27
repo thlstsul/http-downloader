@@ -721,13 +721,12 @@ fn extract_filename_from_content_disposition(headers: &HeaderMap) -> Option<Stri
                 // 处理 filename*=utf-8'encoded%20filename.txt 格式
                 else if part.starts_with("filename*=") && part.len() > "filename*=".len() {
                     let encoded = &part["filename*=".len()..];
-                    if let Some((encoding, filename)) = encoded.split_once('\'') {
-                        if encoding.eq_ignore_ascii_case("utf-8") {
+                    if let Some((encoding, filename)) = encoded.split_once('\'')
+                        && encoding.eq_ignore_ascii_case("utf-8") {
                             // 简单的URL解码
                             let decoded = filename.replace("%20", " ");
                             return Some(decoded);
                         }
-                    }
                 }
             }
 
