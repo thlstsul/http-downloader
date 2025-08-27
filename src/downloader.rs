@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use content_disposition::parse_content_disposition;
 use headers::HeaderMap;
 
 use anyhow::Result;
@@ -694,43 +695,8 @@ fn extract_filename_from_content_disposition(headers: &HeaderMap) -> Option<Stri
         .get("Content-Disposition")
         .and_then(|value| value.to_str().ok())
         .and_then(|disposition| {
-            // 手动解析 Content-Disposition 头，避免依赖 regex
-            let parts: Vec<&str> = disposition.split(';').collect();
-
-            for part in parts {
-                let part = part.trim();
-
-                // 处理 filename="example.txt" 格式
-                if part.starts_with("filename=\"")
-                    && part.ends_with('"')
-                    && part.len() > "filename=\"".len() + 1
-                {
-                    let filename = &part["filename=\"".len()..part.len() - 1];
-                    if !filename.is_empty() {
-                        return Some(filename.to_string());
-                    }
-                }
-                // 处理 filename=example.txt 格式
-                else if part.starts_with("filename=") && part.len() > "filename=".len() {
-                    let filename = &part["filename=".len()..];
-                    let filename = filename.trim_matches(|c| c == '"' || c == '\'');
-                    if !filename.is_empty() {
-                        return Some(filename.to_string());
-                    }
-                }
-                // 处理 filename*=utf-8'encoded%20filename.txt 格式
-                else if part.starts_with("filename*=") && part.len() > "filename*=".len() {
-                    let encoded = &part["filename*=".len()..];
-                    if let Some((encoding, filename)) = encoded.split_once('\'')
-                        && encoding.eq_ignore_ascii_case("utf-8") {
-                            // 简单的URL解码
-                            let decoded = filename.replace("%20", " ");
-                            return Some(decoded);
-                        }
-                }
-            }
-
-            None
+            let disposition = parse_content_disposition(disposition);
+            disposition.filename_full()
         })
 }
 
