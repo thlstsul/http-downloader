@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use headers::HeaderMap;
+
 use anyhow::Result;
 use futures_util::FutureExt;
 #[cfg(feature = "async-stream")]
@@ -20,11 +22,12 @@ use tokio::time::Instant;
 use tokio::{io, sync};
 use tokio_util::sync::CancellationToken;
 
+use crate::downloader_builder::{HttpDownloadConfig, HttpRedirectionHandle};
 use crate::exclusive::Exclusive;
 use crate::{
     ChunkData, ChunkItem, ChunkIterator, ChunkManager, ChunksInfo, DownloadArchiveData,
-    DownloadFuture, DownloadWay, DownloadedLenChangeNotify, DownloaderWrapper, HttpDownloadConfig,
-    HttpRedirectionHandle, RemainingChunks, SingleDownload,
+    DownloadFuture, DownloadWay, DownloadedLenChangeNotify, DownloaderWrapper, RemainingChunks,
+    SingleDownload,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
@@ -162,22 +165,28 @@ impl HttpFileDownloader {
     pub fn new(client: reqwest::Client, config: Arc<HttpDownloadConfig>) -> Self {
         let cancel_token = config.cancel_token.clone().unwrap_or_default();
         let (downloaded_len_sender, downloaded_len_receiver) = sync::watch::channel::<u64>(0);
-        let total_size_semaphore = Arc::new(sync::Semaphore::new(0));
 
         Self {
+            // Configuration and shared state
+            config,
+            client,
+            cancel_token,
+
+            // Download tracking
+            downloaded_len_receiver,
+            downloaded_len_sender: Arc::new(downloaded_len_sender),
+            content_length: Default::default(),
+            downloading_state: Default::default(),
+
+            // Async operations
             downloading_state_oneshot_vec: vec![],
             downloaded_len_change_notify: None,
             archive_data_future: None,
             #[cfg(feature = "breakpoint-resume")]
             breakpoint_resume: None,
-            config,
-            total_size_semaphore,
-            content_length: Default::default(),
-            client,
-            downloading_state: Default::default(),
-            downloaded_len_receiver,
-            downloaded_len_sender: Arc::new(downloaded_len_sender),
-            cancel_token,
+
+            // Semaphore for total size coordination
+            total_size_semaphore: Arc::new(sync::Semaphore::new(0)),
         }
     }
 
@@ -220,34 +229,38 @@ impl HttpFileDownloader {
         let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
         let duration = self.config.downloaded_len_send_interval.clone();
         async_stream::stream! {
-            let downloaded_len = *downloaded_len_receiver.borrow();
-            yield downloaded_len;
+            let mut last_value = *downloaded_len_receiver.borrow();
+            yield last_value;
+
             while downloaded_len_receiver.changed().await.is_ok() {
-                let downloaded_len = *downloaded_len_receiver.borrow();
-                yield downloaded_len;
-                if let Some(duration) = duration{
-                   tokio::time::sleep(duration).await;
+                let current_value = *downloaded_len_receiver.borrow();
+                if current_value != last_value {
+                    yield current_value;
+                    last_value = current_value;
+                }
+                if let Some(duration) = &duration {
+                   tokio::time::sleep(*duration).await;
                 }
             }
         }
     }
 
     #[cfg(feature = "async-stream")]
-    pub fn chunks_stream(&self) -> Option<impl Stream<Item = Vec<Arc<ChunkItem>>> + 'static> {
+    pub fn chunks_stream(&self) -> Option<impl Stream<Item = RemainingChunks> + 'static> {
         match self.downloading_state.read().as_ref() {
             None => None,
             Some((_, downloading_state)) => match &downloading_state.download_way {
                 DownloadWay::Single(_) => None,
                 DownloadWay::Ranges(chunk_manager) => {
                     let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
-                    let chunk_manager = chunk_manager.to_owned();
+                    let chunk_manager = Arc::clone(chunk_manager);
                     let duration = self.config.chunks_send_interval.clone();
                     Some(async_stream::stream! {
-                          yield chunk_manager.get_chunks().await;
+                          yield chunk_manager.get_remaining_chunks().await;
                           while downloaded_len_receiver.changed().await.is_ok() {
-                              yield chunk_manager.get_chunks().await;
-                              if let Some(duration) = duration {
-                                 tokio::time::sleep(duration).await;
+                              yield chunk_manager.get_remaining_chunks().await;
+                              if let Some(duration) = &duration {
+                                 tokio::time::sleep(*duration).await;
                               }
                           }
                     })
@@ -264,14 +277,14 @@ impl HttpFileDownloader {
                 DownloadWay::Single(_) => None,
                 DownloadWay::Ranges(chunk_manager) => {
                     let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
-                    let chunk_manager = chunk_manager.to_owned();
+                    let chunk_manager = Arc::clone(chunk_manager);
                     let duration = self.config.chunks_send_interval.clone();
                     Some(async_stream::stream! {
                           yield chunk_manager.get_chunks_info().await;
                           while downloaded_len_receiver.changed().await.is_ok() {
                               yield chunk_manager.get_chunks_info().await;
-                              if let Some(duration) = duration {
-                                 tokio::time::sleep(duration).await;
+                              if let Some(duration) = &duration {
+                                 tokio::time::sleep(*duration).await;
                               }
                           }
                     })
@@ -285,16 +298,12 @@ impl HttpFileDownloader {
     }
 
     pub fn total_size_future(&self) -> impl Future<Output = Option<NonZeroU64>> + 'static {
-        let total_size_semaphore = self.total_size_semaphore.clone();
-        let content_length = self.content_length.clone();
+        let total_size_semaphore = Arc::clone(&self.total_size_semaphore);
+        let content_length = Arc::clone(&self.content_length);
         async move {
             let _ = total_size_semaphore.acquire().await;
             let content_length = content_length.load(Ordering::Relaxed);
-            if content_length == 0 {
-                None
-            } else {
-                Some(NonZeroU64::new(content_length).unwrap())
-            }
+            NonZeroU64::new(content_length)
         }
     }
 
@@ -378,7 +387,7 @@ impl HttpFileDownloader {
     }
 
     pub fn cancel(&self) -> impl Future<Output = ()> + 'static {
-        let downloading_state = self.downloading_state.clone();
+        let downloading_state = Arc::clone(&self.downloading_state);
         let token = self.cancel_token.clone();
         async move {
             let (receiver, _) = {
@@ -390,7 +399,7 @@ impl HttpFileDownloader {
                 option.unwrap()
             };
             token.cancel();
-            receiver.await.unwrap();
+            let _ = receiver.await;
         }
     }
 
@@ -401,17 +410,20 @@ impl HttpFileDownloader {
         if self.cancel_token.is_cancelled() {
             self.cancel_token = CancellationToken::new();
         }
-        let config = self.config.clone();
+
+        // Clone only what's necessary with explicit Arc::clone for clarity
+        let config = Arc::clone(&self.config);
         let client = self.client.clone();
-        let total_size_semaphore = self.total_size_semaphore.clone();
-        let content_length_arc = self.content_length.clone();
-        let downloading_state = self.downloading_state.clone();
+        let total_size_semaphore = Arc::clone(&self.total_size_semaphore);
+        let content_length_arc = Arc::clone(&self.content_length);
+        let downloading_state = Arc::clone(&self.downloading_state);
+        let downloaded_len_sender = Arc::clone(&self.downloaded_len_sender);
+        let cancel_token = self.cancel_token.clone();
+
+        // Take ownership of optional components
         let downloaded_len_change_notify = self.downloaded_len_change_notify.take();
         let archive_data_future = self.archive_data_future.take();
-        let downloading_state_oneshot_vec: Vec<sync::oneshot::Sender<Arc<DownloadingState>>> =
-            self.downloading_state_oneshot_vec.drain(..).collect();
-        let downloaded_len_sender = self.downloaded_len_sender.clone();
-        let cancel_token = self.cancel_token.clone();
+        let downloading_state_oneshot_vec = std::mem::take(&mut self.downloading_state_oneshot_vec);
         #[cfg(feature = "breakpoint-resume")]
         let breakpoint_resume = self.breakpoint_resume.take();
 
@@ -419,7 +431,7 @@ impl HttpFileDownloader {
             fn request<'a>(
                 client: &'a reqwest::Client,
                 config: &'a HttpDownloadConfig,
-                location: Option<String>,
+                location: Option<&'a str>,
                 redirection_times: usize,
             ) -> BoxFuture<'a, Result<(reqwest::Response, Option<String>), DownloadError>>
             {
@@ -430,10 +442,11 @@ impl HttpFileDownloader {
                     {
                         return Err(DownloadError::RedirectionTimesTooMany);
                     }
+
                     let mut retry_count = 0;
                     let response = loop {
                         let response = client
-                            .execute(config.create_http_request(location.as_deref()))
+                            .execute(config.create_http_request(location))
                             .await
                             .and_then(|n| n.error_for_status());
 
@@ -450,27 +463,29 @@ impl HttpFileDownloader {
                         }
                         break response;
                     };
-                    // todo: 删除重定向，reqwest 本身可以处理重定向
+
                     match response {
                         Ok(response)
                             if config.handle_redirection != HttpRedirectionHandle::Invalid
                                 && response.status().is_redirection() =>
                         {
-                            let Some(location) = response.headers().get(headers::Location::name())
+                            let Some(location_header) =
+                                response.headers().get(headers::Location::name())
                             else {
                                 return Err(DownloadError::HttpRequestResponseInvalid(
                                     HttpResponseInvalidCause::RedirectionNoLocation,
                                     response,
                                 ));
                             };
-                            let Ok(location) = location.to_str().map(|n| n.to_string()) else {
+                            let Ok(location_str) = location_header.to_str() else {
                                 return Err(DownloadError::HttpRequestResponseInvalid(
                                     HttpResponseInvalidCause::RedirectionNoLocation,
                                     response,
                                 ));
                             };
-                            println!("handle_redirection!!!!!!! {}", location);
-                            request(client, config, Some(location), redirection_times + 1).await
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Handling redirection to: {}", location_str);
+                            request(client, config, Some(location_str), redirection_times + 1).await
                         }
                         Ok(response) if !response.status().is_success() => {
                             Err(DownloadError::HttpRequestResponseInvalid(
@@ -479,7 +494,7 @@ impl HttpFileDownloader {
                             ))
                         }
                         Err(err) => Err(DownloadError::HttpRequestFailed(err)),
-                        Ok(response) => Ok((response, location)),
+                        Ok(response) => Ok((response, location.map(|s| s.to_string()))),
                     }
                 }
                 .boxed()
@@ -494,6 +509,11 @@ impl HttpFileDownloader {
                         return Err(err);
                     }
                 };
+
+                // Extract filename from Content-Disposition header if not explicitly set
+                let actual_file_name =
+                    extract_filename_from_content_disposition(response.headers())
+                        .unwrap_or_else(|| config.file_name.clone());
                 let etag = {
                     if config.etag.is_some() {
                         let cur_etag = response.headers().typed_get::<headers::ETag>();
@@ -572,7 +592,7 @@ impl HttpFileDownloader {
                         let chunk_iterator = ChunkIterator::new(content_length, chunk_data);
                         let chunk_manager = Arc::new(ChunkManager::new(
                             config.download_connection_count,
-                            client,
+                            client.clone(),
                             cancel_token,
                             downloaded_len_sender,
                             chunk_iterator,
@@ -599,7 +619,7 @@ impl HttpFileDownloader {
                 let state = Arc::new(state);
                 {
                     let mut guard = downloading_state.write();
-                    *guard = Some((end_receiver, state.clone()));
+                    *guard = Some((end_receiver, Arc::clone(&state)));
                 }
 
                 total_size_semaphore.add_permits(1);
@@ -607,8 +627,11 @@ impl HttpFileDownloader {
                 let file = {
                     let mut options = std::fs::OpenOptions::new();
                     (config.open_option)(&mut options);
+
+                    // Use the actual file path (may be different from config if filename was extracted from headers)
+                    let actual_file_path = config.save_dir.join(&actual_file_name);
                     let mut file = tokio::fs::OpenOptions::from(options)
-                        .open(config.file_path())
+                        .open(&actual_file_path)
                         .await?;
                     if config.set_len_in_advance {
                         file.set_len(content_length.unwrap()).await?
@@ -617,8 +640,8 @@ impl HttpFileDownloader {
                     file
                 };
 
-                for oneshot in downloading_state_oneshot_vec.into_iter() {
-                    oneshot.send(state.clone()).unwrap_or_else(|_| {
+                for oneshot in downloading_state_oneshot_vec {
+                    oneshot.send(Arc::clone(&state)).unwrap_or_else(|_| {
                         #[cfg(feature = "tracing")]
                         tracing::trace!("send download_way failed!");
                     });
@@ -626,10 +649,10 @@ impl HttpFileDownloader {
 
                 let dec_result = match &state.download_way {
                     DownloadWay::Ranges(item) => {
-                        let request = Box::new(config.create_http_request(location.as_deref()));
+                        let request = config.create_http_request(location.as_deref());
                         item.start_download(
                             file,
-                            request,
+                            Box::new(request),
                             downloaded_len_change_notify,
                             #[cfg(feature = "breakpoint-resume")]
                             breakpoint_resume,
@@ -663,6 +686,53 @@ impl HttpFileDownloader {
             Ok(dec)
         }
     }
+}
+
+/// 从HTTP响应头部的Content-Disposition字段提取文件名
+fn extract_filename_from_content_disposition(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Content-Disposition")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|disposition| {
+            // 手动解析 Content-Disposition 头，避免依赖 regex
+            let parts: Vec<&str> = disposition.split(';').collect();
+
+            for part in parts {
+                let part = part.trim();
+
+                // 处理 filename="example.txt" 格式
+                if part.starts_with("filename=\"")
+                    && part.ends_with('"')
+                    && part.len() > "filename=\"".len() + 1
+                {
+                    let filename = &part["filename=\"".len()..part.len() - 1];
+                    if !filename.is_empty() {
+                        return Some(filename.to_string());
+                    }
+                }
+                // 处理 filename=example.txt 格式
+                else if part.starts_with("filename=") && part.len() > "filename=".len() {
+                    let filename = &part["filename=".len()..];
+                    let filename = filename.trim_matches(|c| c == '"' || c == '\'');
+                    if !filename.is_empty() {
+                        return Some(filename.to_string());
+                    }
+                }
+                // 处理 filename*=utf-8'encoded%20filename.txt 格式
+                else if part.starts_with("filename*=") && part.len() > "filename*=".len() {
+                    let encoded = &part["filename*=".len()..];
+                    if let Some((encoding, filename)) = encoded.split_once('\'') {
+                        if encoding.eq_ignore_ascii_case("utf-8") {
+                            // 简单的URL解码
+                            let decoded = filename.replace("%20", " ");
+                            return Some(decoded);
+                        }
+                    }
+                }
+            }
+
+            None
+        })
 }
 
 pub struct ExtendedHttpFileDownloader {
@@ -734,8 +804,7 @@ impl ExtendedHttpFileDownloader {
 
     /// chunks 流，如果还真正的开始下载（获取了请求响应内容）会返回 None，可通过 `total_size_future().await` 等待获取它，避免得到 None
     #[cfg(feature = "async-stream")]
-    #[inline]
-    pub fn chunks_stream(&self) -> Option<impl Stream<Item = Vec<Arc<ChunkItem>>> + 'static> {
+    pub fn chunks_stream(&self) -> Option<impl Stream<Item = RemainingChunks> + 'static> {
         self.inner.chunks_stream()
     }
 

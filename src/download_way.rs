@@ -11,7 +11,11 @@ use tokio::select;
 use tokio::sync;
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChunkManager, DownloadArchiveData, DownloadedLenChangeNotify, DownloadError, DownloadingEndCause, HttpDownloadConfig};
+use crate::downloader_builder::HttpDownloadConfig;
+use crate::{
+    ChunkManager, DownloadArchiveData, DownloadError, DownloadedLenChangeNotify,
+    DownloadingEndCause,
+};
 
 #[derive(Debug)]
 pub struct SingleDownload {

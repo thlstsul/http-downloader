@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ChunkIterator, ChunkRange, DownloadError, chunk_item::ChunkItem};
-use crate::{DownloadedLenChangeNotify, DownloadingEndCause};
+use crate::{DownloadedLenChangeNotify, DownloadingEndCause, RemainingChunks};
 
 #[allow(dead_code)]
 #[cfg_attr(
@@ -334,6 +334,11 @@ impl ChunkManager {
             .collect();
         downloading_chunks.sort_by(|a, b| a.chunk_info.range.start.cmp(&b.chunk_info.range.start));
         downloading_chunks
+    }
+
+    pub async fn get_remaining_chunks(&self) -> RemainingChunks {
+        let guard = self.chunk_iterator.data.read();
+        guard.remaining.clone()
     }
 
     pub async fn get_chunks_info(&self) -> ChunksInfo {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use headers::{ETag, HeaderMap, HeaderMapExt};
+
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -17,27 +18,34 @@ pub enum HttpRedirectionHandle {
 }
 
 pub struct HttpDownloadConfig {
-    // 提前设置长度，如果存储空间不足将提前报错
-    pub set_len_in_advance: bool,
-    pub download_connection_count: NonZeroU8,
-    pub chunk_size: NonZeroUsize,
-    pub chunks_send_interval: Option<Duration>,
+    // Frequently accessed configuration (grouped for cache locality)
+    pub url: Arc<Url>,
     pub save_dir: PathBuf,
     pub file_name: String,
-    pub open_option: Box<dyn Fn(&mut std::fs::OpenOptions) + Send + Sync + 'static>,
-    pub create_dir: bool,
-    pub url: Arc<Url>,
-    pub etag: Option<ETag>,
-    pub request_retry_count: u8,
-    // pub timeout: Option<Duration>,
     pub header_map: HeaderMap,
-    pub downloaded_len_send_interval: Option<Duration>,
+
+    // Download parameters
+    pub download_connection_count: NonZeroU8,
+    pub chunk_size: NonZeroUsize,
+    pub request_retry_count: u8,
     pub strict_check_accept_ranges: bool,
+
+    // Timing and intervals
+    pub chunks_send_interval: Option<Duration>,
+    pub downloaded_len_send_interval: Option<Duration>,
+
+    // Optional components (less frequently accessed)
+    pub etag: Option<ETag>,
+    pub cancel_token: Option<CancellationToken>,
     pub http_request_configure:
         Option<Box<dyn Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static>>,
-    pub cancel_token: Option<CancellationToken>,
-    pub handle_redirection: HttpRedirectionHandle,
+    pub open_option: Box<dyn Fn(&mut std::fs::OpenOptions) + Send + Sync + 'static>,
+
+    // Flags and enums
+    pub set_len_in_advance: bool,
+    pub create_dir: bool,
     pub use_browser_user_agent: bool,
+    pub handle_redirection: HttpRedirectionHandle,
 }
 
 impl HttpDownloadConfig {
@@ -50,29 +58,38 @@ impl HttpDownloadConfig {
         &self,
         redirection_location: Option<&str>,
     ) -> reqwest::Request {
-        let mut url = (*self.url).clone().clone();
+        let mut url = self.url.as_ref().clone();
         if let Some(location) = redirection_location {
             url.set_path(location);
         }
+
         let mut request = reqwest::Request::new(reqwest::Method::GET, url);
         let header_map = request.headers_mut();
+
+        // Pre-allocate common headers
         if self.use_browser_user_agent {
-            header_map.insert(reqwest::header::USER_AGENT, headers::HeaderValue::from_str("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.48").unwrap());
+            static USER_AGENT: headers::HeaderValue = headers::HeaderValue::from_static(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.48",
+            );
+            header_map.insert(reqwest::header::USER_AGENT, USER_AGENT.clone());
         }
-        header_map.insert(
-            reqwest::header::ACCEPT,
-            headers::HeaderValue::from_str("*/*").unwrap(),
-        );
+
+        static ACCEPT_ALL: headers::HeaderValue = headers::HeaderValue::from_static("*/*");
+        header_map.insert(reqwest::header::ACCEPT, ACCEPT_ALL.clone());
         header_map.typed_insert(headers::Connection::keep_alive());
-        for (header_name, header_value) in self.header_map.iter() {
-            header_map.insert(header_name, header_value.clone());
+
+        // Clone headers only when necessary
+        if !self.header_map.is_empty() {
+            header_map.extend(self.header_map.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        // 限速后超时会出现异常?
+
+        // Disable timeout to prevent issues with rate limiting
         *request.timeout_mut() = None;
-        // *request.timeout_mut() = self.config.timeout;
-        match self.http_request_configure.as_ref() {
-            None => request,
-            Some(configure) => configure(request),
+
+        if let Some(configure) = self.http_request_configure.as_ref() {
+            configure(request)
+        } else {
+            request
         }
     }
 }
@@ -104,28 +121,38 @@ pub struct HttpDownloaderBuilder {
 impl HttpDownloaderBuilder {
     pub fn new(url: Url, save_dir: PathBuf) -> Self {
         Self {
-            client: None,
-            chunk_size: NonZeroUsize::new(1024 * 1024 * 4).unwrap(), // 4M,
+            // Core configuration
+            url,
+            save_dir,
             file_name: None,
+            header_map: HeaderMap::new(),
+
+            // Download parameters with sensible defaults
+            download_connection_count: NonZeroU8::new(3).unwrap(),
+            chunk_size: NonZeroUsize::new(4 * 1024 * 1024).unwrap(), // 4MB
+            request_retry_count: 3,
+            strict_check_accept_ranges: true,
+
+            // Timing defaults
+            chunks_send_interval: Some(Duration::from_millis(300)),
+            downloaded_len_send_interval: Some(Duration::from_millis(300)),
+
+            // Optional components
+            etag: None,
+            cancel_token: None,
+            http_request_configure: None,
             open_option: Box::new(|o| {
                 o.create(true).write(true);
             }),
-            create_dir: true,
-            request_retry_count: 3,
-            download_connection_count: NonZeroU8::new(3).unwrap(),
-            url,
-            save_dir,
-            etag: None,
-            // timeout: None,
-            header_map: Default::default(),
-            downloaded_len_send_interval: Some(Duration::from_millis(300)),
-            chunks_send_interval: Some(Duration::from_millis(300)),
-            strict_check_accept_ranges: true,
-            http_request_configure: None,
+
+            // Flags and enums
             set_len_in_advance: false,
-            cancel_token: None,
-            handle_redirection: HttpRedirectionHandle::RequestNewLocation { max_times: 8 },
+            create_dir: true,
             use_browser_user_agent: true,
+            handle_redirection: HttpRedirectionHandle::RequestNewLocation { max_times: 8 },
+
+            // Client (optional)
+            client: None,
         }
     }
 
@@ -200,6 +227,11 @@ impl HttpDownloaderBuilder {
         self
     }
 
+    pub fn file_name_str(mut self, file_name: &str) -> Self {
+        self.file_name = Some(file_name.to_string());
+        self
+    }
+
     /// chunk 大小
     pub fn chunk_size(mut self, chunk_size: NonZeroUsize) -> Self {
         self.chunk_size = chunk_size;
@@ -239,32 +271,38 @@ impl HttpDownloaderBuilder {
         self,
         extension_builder: DEB,
     ) -> (ExtendedHttpFileDownloader, DEB::ExtensionState) {
-        let mut downloader = HttpFileDownloader::new(
-            self.client.unwrap_or_default(),
-            Arc::new(HttpDownloadConfig {
-                set_len_in_advance: self.set_len_in_advance,
-                download_connection_count: self.download_connection_count,
-                chunk_size: self.chunk_size,
-                file_name: self
-                    .file_name
-                    .unwrap_or_else(|| self.url.file_name().to_string()),
-                open_option: self.open_option,
-                create_dir: self.create_dir,
-                url: Arc::new(self.url),
-                save_dir: self.save_dir,
-                etag: self.etag,
-                request_retry_count: self.request_retry_count,
-                // timeout: self.timeout,
-                header_map: self.header_map,
-                downloaded_len_send_interval: self.downloaded_len_send_interval,
-                chunks_send_interval: self.chunks_send_interval,
-                strict_check_accept_ranges: self.strict_check_accept_ranges,
-                http_request_configure: self.http_request_configure,
-                cancel_token: self.cancel_token,
-                handle_redirection: self.handle_redirection,
-                use_browser_user_agent: true,
-            }),
-        );
+        let file_name = self
+            .file_name
+            .unwrap_or_else(|| self.url.file_name().to_string());
+
+        let config = HttpDownloadConfig {
+            url: Arc::new(self.url),
+            save_dir: self.save_dir,
+            file_name,
+            header_map: self.header_map,
+
+            download_connection_count: self.download_connection_count,
+            chunk_size: self.chunk_size,
+            request_retry_count: self.request_retry_count,
+            strict_check_accept_ranges: self.strict_check_accept_ranges,
+
+            chunks_send_interval: self.chunks_send_interval,
+            downloaded_len_send_interval: self.downloaded_len_send_interval,
+
+            etag: self.etag,
+            cancel_token: self.cancel_token,
+            http_request_configure: self.http_request_configure,
+            open_option: self.open_option,
+
+            set_len_in_advance: self.set_len_in_advance,
+            create_dir: self.create_dir,
+            use_browser_user_agent: self.use_browser_user_agent,
+            handle_redirection: self.handle_redirection,
+        };
+
+        let client = self.client.unwrap_or_default();
+        let mut downloader = HttpFileDownloader::new(client, Arc::new(config));
+
         let (extension, es) = extension_builder.build(&mut downloader);
         (
             ExtendedHttpFileDownloader::new(downloader, Box::new(extension)),
@@ -279,17 +317,18 @@ pub trait UrlFileName {
 
 impl UrlFileName for Url {
     fn file_name(&self) -> Cow<'_, str> {
-        let website_default: &'static str = "index.html";
+        const WEBSITE_DEFAULT: &str = "index.html";
+
         self.path_segments()
-            .map(|mut n| {
-                n.next_back()
-                    .map(|n| Cow::Borrowed(if n.is_empty() { website_default } else { n }))
-                    .unwrap_or_else(|| {
-                        self.domain()
-                            .map(Cow::Borrowed)
-                            .unwrap_or(Cow::Owned(website_default.to_string()))
-                    })
+            .and_then(|mut segments| segments.next_back())
+            .map(|last_segment| {
+                if last_segment.is_empty() {
+                    Cow::Borrowed(WEBSITE_DEFAULT)
+                } else {
+                    Cow::Borrowed(last_segment)
+                }
             })
-            .unwrap_or_else(|| Cow::Owned(website_default.to_string()))
+            .or_else(|| self.domain().map(Cow::Borrowed))
+            .unwrap_or(Cow::Borrowed(WEBSITE_DEFAULT))
     }
 }
