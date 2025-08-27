@@ -2,10 +2,10 @@ use std::io::SeekFrom;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Result};
+use anyhow::Result;
 use bytes::Bytes;
-use futures_util::future::{BoxFuture, OptionFuture};
 use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, OptionFuture};
 use headers::HeaderMapExt;
 use reqwest::Request;
 use tokio::fs::File;
@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::{ChunkInfo, ChunkManager, ChunkRange, DownloadError, DownloadingEndCause};
 
 pub trait DownloadedLenChangeNotify: Send + Sync {
-    fn receive_len(&self, len: usize) -> OptionFuture<BoxFuture<()>>;
+    fn receive_len(&self, len: usize) -> OptionFuture<BoxFuture<'_, ()>>;
 }
 
 pub struct ChunkItem {
@@ -78,12 +78,12 @@ impl ChunkItem {
                         self.chunk_info.range.start + chunk_bytes.len() as u64,
                         self.chunk_info.range.end,
                     )
-                        .to_range_header(),
+                    .to_range_header(),
                 );
                 // 避免 clone request ?
                 let response = self.client.execute(*ChunkManager::clone_request(&request));
                 #[cfg(feature = "tracing")]
-                    let response = response.instrument(tracing::info_span!("chunk's http request"));
+                let response = response.instrument(tracing::info_span!("chunk's http request"));
                 let response = match response.await {
                     Ok(response) => {
                         cur_retry_count = 0;
@@ -119,9 +119,9 @@ impl ChunkItem {
                 let mut stream = response.bytes_stream();
                 while let Some(bytes) = stream.next().await {
                     #[cfg(feature = "tracing")]
-                        let span = tracing::info_span!("process received bytes", is_ok = bytes.is_ok());
+                    let span = tracing::info_span!("process received bytes", is_ok = bytes.is_ok());
                     #[cfg(feature = "tracing")]
-                        let _ = span.enter();
+                    let _ = span.enter();
                     let bytes: Bytes = {
                         match bytes {
                             Ok(bytes) => {
@@ -192,39 +192,39 @@ impl ChunkItem {
         }
     }
     /*
-        pub(crate) fn start_download(
-            self: Arc<Self>,
-            request: Box<Request>,
-            retry_count: u8,
-        ) -> DownloadedChunkItem {
-            use futures_util::FutureExt;
+    pub(crate) fn start_download(
+        self: Arc<Self>,
+        request: Box<Request>,
+        retry_count: u8,
+    ) -> DownloadedChunkItem {
+        use futures_util::FutureExt;
 
-            let chunk_item = self.clone();
-            let join_handle = tokio::spawn(self.download_chunk(request, retry_count).then(
-                |result| async move {
-                    match result {
-                        Ok(is_finished) => {
-                            if is_finished {
-                                self.send_message(ChunkMessageKind::DownloadFinished)
-                                    .await
-                                    .unwrap_or_else(|_err| {
-                                        #[cfg(feature = "tracing")]
-                                        tracing::trace!("ChunkMessageInfoSendFailed! {:?}", _err);
-                                    })
-                            }
+        let chunk_item = self.clone();
+        let join_handle = tokio::spawn(self.download_chunk(request, retry_count).then(
+            |result| async move {
+                match result {
+                    Ok(is_finished) => {
+                        if is_finished {
+                            self.send_message(ChunkMessageKind::DownloadFinished)
+                                .await
+                                .unwrap_or_else(|_err| {
+                                    #[cfg(feature = "tracing")]
+                                    tracing::trace!("ChunkMessageInfoSendFailed! {:?}", _err);
+                                })
                         }
-                        Err(err) => self
-                            .send_message(ChunkMessageKind::Error(err))
-                            .await
-                            .unwrap_or_else(|_err| {
-                                #[cfg(feature = "tracing")]
-                                tracing::trace!("ChunkMessageInfoSendFailed! {:?}", _err);
-                            }),
-                    };
-                },
-            ));
-            DownloadedChunkItem::new(chunk_item, join_handle)
-        }*/
+                    }
+                    Err(err) => self
+                        .send_message(ChunkMessageKind::Error(err))
+                        .await
+                        .unwrap_or_else(|_err| {
+                            #[cfg(feature = "tracing")]
+                            tracing::trace!("ChunkMessageInfoSendFailed! {:?}", _err);
+                        }),
+                };
+            },
+        ));
+        DownloadedChunkItem::new(chunk_item, join_handle)
+    }*/
 }
 
 /*pub struct DownloadedChunkItem {

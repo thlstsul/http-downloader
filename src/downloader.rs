@@ -1,27 +1,31 @@
 use std::future::Future;
 use std::io::SeekFrom;
-use std::num::{NonZeroU64, NonZeroU8, NonZeroUsize};
+use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use anyhow::Result;
-use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 #[cfg(feature = "async-stream")]
 use futures_util::Stream;
+use futures_util::future::BoxFuture;
 use headers::{Header, HeaderMapExt};
 use parking_lot::RwLock;
 use thiserror::Error;
-use tokio::{io, sync};
 use tokio::io::AsyncSeekExt;
 use tokio::sync::watch::error::SendError;
 use tokio::task::JoinError;
 use tokio::time::Instant;
+use tokio::{io, sync};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChunkData, ChunkItem, ChunkIterator, ChunkManager, ChunksInfo, DownloadArchiveData, DownloadedLenChangeNotify, DownloaderWrapper, DownloadFuture, DownloadWay, HttpDownloadConfig, HttpRedirectionHandle, RemainingChunks, SingleDownload};
 use crate::exclusive::Exclusive;
+use crate::{
+    ChunkData, ChunkItem, ChunkIterator, ChunkManager, ChunksInfo, DownloadArchiveData,
+    DownloadFuture, DownloadWay, DownloadedLenChangeNotify, DownloaderWrapper, HttpDownloadConfig,
+    HttpRedirectionHandle, RemainingChunks, SingleDownload,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum DownloadingEndCause {
@@ -131,19 +135,24 @@ pub struct BreakpointResume {
 pub struct HttpFileDownloader {
     pub downloading_state_oneshot_vec: Vec<sync::oneshot::Sender<Arc<DownloadingState>>>,
     pub downloaded_len_change_notify: Option<Arc<dyn DownloadedLenChangeNotify>>,
-    pub archive_data_future: Option<Exclusive<BoxFuture<'static, Result<Option<Box<DownloadArchiveData>>>>>>,
+    #[allow(clippy::type_complexity)]
+    pub archive_data_future:
+        Option<Exclusive<BoxFuture<'static, Result<Option<Box<DownloadArchiveData>>>>>>,
     #[cfg(feature = "breakpoint-resume")]
     pub breakpoint_resume: Option<Arc<BreakpointResume>>,
     pub config: Arc<HttpDownloadConfig>,
     pub downloaded_len_receiver: sync::watch::Receiver<u64>,
     pub content_length: Arc<AtomicU64>,
     client: reqwest::Client,
-    downloading_state: Arc<RwLock<
-        Option<(
-            sync::oneshot::Receiver<DownloadingEndCause>,
-            Arc<DownloadingState>,
-        )>,
-    >>,
+    #[allow(clippy::type_complexity)]
+    downloading_state: Arc<
+        RwLock<
+            Option<(
+                sync::oneshot::Receiver<DownloadingEndCause>,
+                Arc<DownloadingState>,
+            )>,
+        >,
+    >,
     downloaded_len_sender: Arc<sync::watch::Sender<u64>>,
     pub cancel_token: CancellationToken,
     total_size_semaphore: Arc<sync::Semaphore>,
@@ -207,7 +216,7 @@ impl HttpFileDownloader {
     }
 
     #[cfg(feature = "async-stream")]
-    pub fn downloaded_len_stream(&self) -> impl Stream<Item=u64> + 'static {
+    pub fn downloaded_len_stream(&self) -> impl Stream<Item = u64> + 'static {
         let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
         let duration = self.config.downloaded_len_send_interval.clone();
         async_stream::stream! {
@@ -224,17 +233,11 @@ impl HttpFileDownloader {
     }
 
     #[cfg(feature = "async-stream")]
-    pub fn chunks_stream(&self) -> Option<impl Stream<Item=Vec<Arc<ChunkItem>>> + 'static> {
+    pub fn chunks_stream(&self) -> Option<impl Stream<Item = Vec<Arc<ChunkItem>>> + 'static> {
         match self.downloading_state.read().as_ref() {
-            None => {
-                // tracing::info!("downloading_state is null!");
-                None
-            }
+            None => None,
             Some((_, downloading_state)) => match &downloading_state.download_way {
-                DownloadWay::Single(_) => {
-                    // tracing::info!("DownloadWay is Single!");
-                    None
-                }
+                DownloadWay::Single(_) => None,
                 DownloadWay::Ranges(chunk_manager) => {
                     let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
                     let chunk_manager = chunk_manager.to_owned();
@@ -254,17 +257,11 @@ impl HttpFileDownloader {
     }
 
     #[cfg(feature = "async-stream")]
-    pub fn chunks_info_stream(&self) -> Option<impl Stream<Item=ChunksInfo> + 'static> {
+    pub fn chunks_info_stream(&self) -> Option<impl Stream<Item = ChunksInfo> + 'static> {
         match self.downloading_state.read().as_ref() {
-            None => {
-                // tracing::info!("downloading_state is null!");
-                None
-            }
+            None => None,
             Some((_, downloading_state)) => match &downloading_state.download_way {
-                DownloadWay::Single(_) => {
-                    // tracing::info!("DownloadWay is Single!");
-                    None
-                }
+                DownloadWay::Single(_) => None,
                 DownloadWay::Ranges(chunk_manager) => {
                     let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
                     let chunk_manager = chunk_manager.to_owned();
@@ -287,7 +284,7 @@ impl HttpFileDownloader {
         *self.downloaded_len_receiver.borrow()
     }
 
-    pub fn total_size_future(&self) -> impl Future<Output=Option<NonZeroU64>> + 'static {
+    pub fn total_size_future(&self) -> impl Future<Output = Option<NonZeroU64>> + 'static {
         let total_size_semaphore = self.total_size_semaphore.clone();
         let content_length = self.content_length.clone();
         async move {
@@ -311,13 +308,15 @@ impl HttpFileDownloader {
     }
 
     pub fn get_chunk_manager(&self) -> Option<Weak<ChunkManager>> {
-        self.get_downloading_state().and_then(|n|n.upgrade()).and_then(|downloading_state| {
-            if let DownloadWay::Ranges(item) = &downloading_state.download_way {
-                Some(Arc::downgrade(item))
-            } else {
-                None
-            }
-        })
+        self.get_downloading_state()
+            .and_then(|n| n.upgrade())
+            .and_then(|downloading_state| {
+                if let DownloadWay::Ranges(item) = &downloading_state.download_way {
+                    Some(Arc::downgrade(item))
+                } else {
+                    None
+                }
+            })
     }
     pub fn get_downloading_state(&self) -> Option<Weak<DownloadingState>> {
         let guard = &self.downloading_state.read();
@@ -325,14 +324,14 @@ impl HttpFileDownloader {
     }
 
     pub async fn get_chunks(&self) -> Vec<Arc<ChunkItem>> {
-        match self.get_chunk_manager().and_then(|n|n.upgrade()) {
+        match self.get_chunk_manager().and_then(|n| n.upgrade()) {
             None => Vec::new(),
             Some(n) => n.get_chunks().await,
         }
     }
 
     pub async fn get_chunks_info(&self) -> Option<ChunksInfo> {
-        match self.get_chunk_manager().and_then(|n|n.upgrade()) {
+        match self.get_chunk_manager().and_then(|n| n.upgrade()) {
             None => None,
             Some(n) => Some(n.get_chunks_info().await),
         }
@@ -352,7 +351,7 @@ impl HttpFileDownloader {
     pub(crate) fn download(
         &mut self,
     ) -> Result<
-        impl Future<Output=Result<DownloadingEndCause, DownloadError>> + Send + 'static,
+        impl Future<Output = Result<DownloadingEndCause, DownloadError>> + Send + 'static,
         DownloadStartError,
     > {
         self.reset();
@@ -378,7 +377,7 @@ impl HttpFileDownloader {
         guard.take()
     }
 
-    pub fn cancel(&self) -> impl Future<Output=()> + 'static {
+    pub fn cancel(&self) -> impl Future<Output = ()> + 'static {
         let downloading_state = self.downloading_state.clone();
         let token = self.cancel_token.clone();
         async move {
@@ -398,7 +397,7 @@ impl HttpFileDownloader {
     //noinspection RsExternalLinter
     fn start_download(
         &mut self,
-    ) -> impl Future<Output=Result<DownloadingEndCause, DownloadError>> + 'static {
+    ) -> impl Future<Output = Result<DownloadingEndCause, DownloadError>> + 'static {
         if self.cancel_token.is_cancelled() {
             self.cancel_token = CancellationToken::new();
         }
@@ -409,60 +408,81 @@ impl HttpFileDownloader {
         let downloading_state = self.downloading_state.clone();
         let downloaded_len_change_notify = self.downloaded_len_change_notify.take();
         let archive_data_future = self.archive_data_future.take();
-        let downloading_state_oneshot_vec: Vec<sync::oneshot::Sender<Arc<DownloadingState>>> = self.downloading_state_oneshot_vec.drain(..).collect();
+        let downloading_state_oneshot_vec: Vec<sync::oneshot::Sender<Arc<DownloadingState>>> =
+            self.downloading_state_oneshot_vec.drain(..).collect();
         let downloaded_len_sender = self.downloaded_len_sender.clone();
         let cancel_token = self.cancel_token.clone();
         #[cfg(feature = "breakpoint-resume")]
-            let breakpoint_resume = self.breakpoint_resume.take();
-
+        let breakpoint_resume = self.breakpoint_resume.take();
 
         async move {
-            fn request<'a>(client: &'a reqwest::Client, config: &'a HttpDownloadConfig, location: Option<String>, redirection_times: usize) -> BoxFuture<'a, Result<(reqwest::Response, Option<String>), DownloadError>> {
+            fn request<'a>(
+                client: &'a reqwest::Client,
+                config: &'a HttpDownloadConfig,
+                location: Option<String>,
+                redirection_times: usize,
+            ) -> BoxFuture<'a, Result<(reqwest::Response, Option<String>), DownloadError>>
+            {
                 async move {
-                    if let HttpRedirectionHandle::RequestNewLocation { max_times } = config.handle_redirection {
-                        if redirection_times >= max_times {
-                            return Err(DownloadError::RedirectionTimesTooMany);
-                        }
+                    if let HttpRedirectionHandle::RequestNewLocation { max_times } =
+                        config.handle_redirection
+                        && redirection_times >= max_times
+                    {
+                        return Err(DownloadError::RedirectionTimesTooMany);
                     }
                     let mut retry_count = 0;
                     let response = loop {
-                        let response = client.execute(config.create_http_request(location.as_ref().map(|n| n.as_str())))
-                            .await.and_then(|n| n.error_for_status());
+                        let response = client
+                            .execute(config.create_http_request(location.as_deref()))
+                            .await
+                            .and_then(|n| n.error_for_status());
 
                         if response.is_err() && retry_count < config.request_retry_count {
                             retry_count += 1;
                             #[cfg(feature = "tracing")]
                             tracing::trace!(
-                            "Request error! {:?},retry_info: {}/{}",
-                            response.unwrap_err(),
-                            retry_count,
-                            config.request_retry_count
-                        );
+                                "Request error! {:?},retry_info: {}/{}",
+                                response.unwrap_err(),
+                                retry_count,
+                                config.request_retry_count
+                            );
                             continue;
                         }
                         break response;
                     };
                     // todo: 删除重定向，reqwest 本身可以处理重定向
                     match response {
-                        Ok(response) if config.handle_redirection != HttpRedirectionHandle::Invalid && response.status().is_redirection() => {
-                            let Some(location) = response.headers().get(headers::Location::name()) else {
-                                return Err(DownloadError::HttpRequestResponseInvalid(HttpResponseInvalidCause::RedirectionNoLocation, response));
+                        Ok(response)
+                            if config.handle_redirection != HttpRedirectionHandle::Invalid
+                                && response.status().is_redirection() =>
+                        {
+                            let Some(location) = response.headers().get(headers::Location::name())
+                            else {
+                                return Err(DownloadError::HttpRequestResponseInvalid(
+                                    HttpResponseInvalidCause::RedirectionNoLocation,
+                                    response,
+                                ));
                             };
                             let Ok(location) = location.to_str().map(|n| n.to_string()) else {
-                                return Err(DownloadError::HttpRequestResponseInvalid(HttpResponseInvalidCause::RedirectionNoLocation, response));
+                                return Err(DownloadError::HttpRequestResponseInvalid(
+                                    HttpResponseInvalidCause::RedirectionNoLocation,
+                                    response,
+                                ));
                             };
-                            println!("handle_redirection!!!!!!! {}",location);
+                            println!("handle_redirection!!!!!!! {}", location);
                             request(client, config, Some(location), redirection_times + 1).await
                         }
                         Ok(response) if !response.status().is_success() => {
-                            Err(DownloadError::HttpRequestResponseInvalid(HttpResponseInvalidCause::StatusCodeUnsuccessful, response))
+                            Err(DownloadError::HttpRequestResponseInvalid(
+                                HttpResponseInvalidCause::StatusCodeUnsuccessful,
+                                response,
+                            ))
                         }
-                        Err(err) => {
-                            Err(DownloadError::HttpRequestFailed(err))
-                        }
+                        Err(err) => Err(DownloadError::HttpRequestFailed(err)),
                         Ok(response) => Ok((response, location)),
                     }
-                }.boxed()
+                }
+                .boxed()
             }
 
             let (end_sender, end_receiver) = sync::oneshot::channel();
@@ -471,7 +491,7 @@ impl HttpFileDownloader {
                     Ok(r) => r,
                     Err(err) => {
                         total_size_semaphore.add_permits(1);
-                        return Err(err.into());
+                        return Err(err);
                     }
                 };
                 let etag = {
@@ -480,10 +500,10 @@ impl HttpFileDownloader {
                         if cur_etag == config.etag {
                             #[cfg(feature = "tracing")]
                             tracing::trace!(
-                        "etag mismatching,your etag: {:?} , current etag:{:?}",
-                        config.etag,
-                        cur_etag
-                    );
+                                "etag mismatching,your etag: {:?} , current etag:{:?}",
+                                config.etag,
+                                cur_etag
+                            );
                             total_size_semaphore.add_permits(1);
                             return Err(DownloadError::ServerFileAlreadyChanged);
                         }
@@ -500,33 +520,36 @@ impl HttpFileDownloader {
 
                 if let Some(0) = content_length {
                     total_size_semaphore.add_permits(1);
-                    return Err(DownloadError::HttpRequestResponseInvalid(HttpResponseInvalidCause::ContentLengthInvalid, response));
+                    return Err(DownloadError::HttpRequestResponseInvalid(
+                        HttpResponseInvalidCause::ContentLengthInvalid,
+                        response,
+                    ));
                 }
                 content_length_arc.store(content_length.unwrap_or(0), Ordering::Relaxed);
 
                 let accept_ranges = response.headers().typed_get::<headers::AcceptRanges>();
 
                 let is_ranges_bytes_none = accept_ranges.is_none();
-                let is_ranges_bytes =
-                    !is_ranges_bytes_none && accept_ranges.unwrap() == headers::AcceptRanges::bytes();
+                let is_ranges_bytes = !is_ranges_bytes_none
+                    && accept_ranges.unwrap() == headers::AcceptRanges::bytes();
                 let archive_data = match archive_data_future {
-                    None => { None }
-                    Some(archive_data_future) => {
-                        archive_data_future.await.map_err(DownloadError::ArchiveDataLoadError)?
-                    }
+                    None => None,
+                    Some(archive_data_future) => archive_data_future
+                        .await
+                        .map_err(DownloadError::ArchiveDataLoadError)?,
                 };
-                let downloading_duration = archive_data.as_ref()
+                let downloading_duration = archive_data
+                    .as_ref()
                     .map(|n| n.downloading_duration)
                     .unwrap_or(0);
                 let download_way = {
-                    if content_length.is_some()
+                    if let Some(content_length) = content_length
                         && (if config.strict_check_accept_ranges {
-                        is_ranges_bytes
-                    } else {
-                        is_ranges_bytes_none || is_ranges_bytes
-                    })
+                            is_ranges_bytes
+                        } else {
+                            is_ranges_bytes_none || is_ranges_bytes
+                        })
                     {
-                        let content_length = content_length.unwrap();
                         let chunk_data = archive_data
                             .and_then(|archive_data| {
                                 downloaded_len_sender
@@ -573,7 +596,6 @@ impl HttpFileDownloader {
                     download_way,
                 };
 
-
                 let state = Arc::new(state);
                 {
                     let mut guard = downloading_state.write();
@@ -604,15 +626,15 @@ impl HttpFileDownloader {
 
                 let dec_result = match &state.download_way {
                     DownloadWay::Ranges(item) => {
-                        let request = Box::new(config.create_http_request(location.as_ref().map(|n| n.as_str())));
+                        let request = Box::new(config.create_http_request(location.as_deref()));
                         item.start_download(
                             file,
                             request,
                             downloaded_len_change_notify,
                             #[cfg(feature = "breakpoint-resume")]
-                                breakpoint_resume,
+                            breakpoint_resume,
                         )
-                            .await
+                        .await
                     }
                     DownloadWay::Single(item) => {
                         item.download(
@@ -621,14 +643,11 @@ impl HttpFileDownloader {
                             downloaded_len_change_notify,
                             config.chunk_size.get(),
                         )
-                            .await
+                        .await
                     }
                 };
 
-                if {
-                    let r = downloading_state.read().is_some();
-                    r
-                } {
+                if downloading_state.read().is_some() {
                     let mut guard = downloading_state.write();
                     *guard = None;
                 }
@@ -666,13 +685,17 @@ impl ExtendedHttpFileDownloader {
     pub fn prepare_download(&mut self) -> Result<DownloadFuture, DownloadStartError> {
         self.downloader_wrapper.prepare_download(&mut self.inner)?;
         let prepare_download_result = self.inner.download();
-        let download_future = self.downloader_wrapper.handle_prepare_download_result(&mut self.inner, prepare_download_result.map(|n| n.boxed()))?;
+        let download_future = self.downloader_wrapper.handle_prepare_download_result(
+            &mut self.inner,
+            prepare_download_result.map(|n| n.boxed()),
+        )?;
 
-        self.downloader_wrapper.download(&mut self.inner, download_future)
+        self.downloader_wrapper
+            .download(&mut self.inner, download_future)
     }
 
     /// 取消下载
-    pub fn cancel(&self) -> impl Future<Output=()> + 'static {
+    pub fn cancel(&self) -> impl Future<Output = ()> + 'static {
         let cancel = self.downloader_wrapper.on_cancel();
         let cancel_future = self.inner.cancel();
         async move {
@@ -690,7 +713,7 @@ impl ExtendedHttpFileDownloader {
     /// 已下载长度流
     #[cfg(feature = "async-stream")]
     #[inline]
-    pub fn downloaded_len_stream(&self) -> impl Stream<Item=u64> + 'static {
+    pub fn downloaded_len_stream(&self) -> impl Stream<Item = u64> + 'static {
         self.inner.downloaded_len_stream()
     }
 
@@ -712,14 +735,14 @@ impl ExtendedHttpFileDownloader {
     /// chunks 流，如果还真正的开始下载（获取了请求响应内容）会返回 None，可通过 `total_size_future().await` 等待获取它，避免得到 None
     #[cfg(feature = "async-stream")]
     #[inline]
-    pub fn chunks_stream(&self) -> Option<impl Stream<Item=Vec<Arc<ChunkItem>>> + 'static> {
+    pub fn chunks_stream(&self) -> Option<impl Stream<Item = Vec<Arc<ChunkItem>>> + 'static> {
         self.inner.chunks_stream()
     }
 
     /// chunks 信息流，如果还真正的开始下载（获取了请求响应内容）会返回 None，可通过 `total_size_future().await` 等待获取它，避免得到 None
     #[cfg(feature = "async-stream")]
     #[inline]
-    pub fn chunks_info_stream(&self) -> Option<impl Stream<Item=ChunksInfo>> {
+    pub fn chunks_info_stream(&self) -> Option<impl Stream<Item = ChunksInfo>> {
         self.inner.chunks_info_stream()
     }
 
@@ -731,7 +754,7 @@ impl ExtendedHttpFileDownloader {
 
     /// 总大小，会等待服务器响应，如果文件无大小则返回 None
     #[inline]
-    pub fn total_size_future(&self) -> impl Future<Output=Option<NonZeroU64>> + 'static {
+    pub fn total_size_future(&self) -> impl Future<Output = Option<NonZeroU64>> + 'static {
         self.inner.total_size_future()
     }
 

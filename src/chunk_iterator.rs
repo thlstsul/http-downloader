@@ -239,7 +239,7 @@ impl ChunkRange {
     }
 }
 
-impl<'a> RangeBounds<u64> for &'a ChunkRange {
+impl RangeBounds<u64> for &ChunkRange {
     fn start_bound(&self) -> Bound<&u64> {
         Bound::Included(&self.start)
     }

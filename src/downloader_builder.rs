@@ -13,9 +13,7 @@ use crate::{DownloadExtensionBuilder, ExtendedHttpFileDownloader, HttpFileDownlo
 #[derive(Debug, PartialEq)]
 pub enum HttpRedirectionHandle {
     Invalid,
-    RequestNewLocation {
-        max_times: usize
-    },
+    RequestNewLocation { max_times: usize },
 }
 
 pub struct HttpDownloadConfig {
@@ -35,7 +33,8 @@ pub struct HttpDownloadConfig {
     pub header_map: HeaderMap,
     pub downloaded_len_send_interval: Option<Duration>,
     pub strict_check_accept_ranges: bool,
-    pub http_request_configure: Option<Box<dyn Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static>>,
+    pub http_request_configure:
+        Option<Box<dyn Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static>>,
     pub cancel_token: Option<CancellationToken>,
     pub handle_redirection: HttpRedirectionHandle,
     pub use_browser_user_agent: bool,
@@ -47,7 +46,10 @@ impl HttpDownloadConfig {
         self.save_dir.join(&self.file_name)
     }
 
-    pub(crate) fn create_http_request(&self, redirection_location: Option<&str>) -> reqwest::Request {
+    pub(crate) fn create_http_request(
+        &self,
+        redirection_location: Option<&str>,
+    ) -> reqwest::Request {
         let mut url = (*self.url).clone().clone();
         if let Some(location) = redirection_location {
             url.set_path(location);
@@ -57,7 +59,10 @@ impl HttpDownloadConfig {
         if self.use_browser_user_agent {
             header_map.insert(reqwest::header::USER_AGENT, headers::HeaderValue::from_str("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.48").unwrap());
         }
-        header_map.insert(reqwest::header::ACCEPT, headers::HeaderValue::from_str("*/*").unwrap());
+        header_map.insert(
+            reqwest::header::ACCEPT,
+            headers::HeaderValue::from_str("*/*").unwrap(),
+        );
         header_map.typed_insert(headers::Connection::keep_alive());
         for (header_name, header_value) in self.header_map.iter() {
             header_map.insert(header_name, header_value.clone());
@@ -66,10 +71,8 @@ impl HttpDownloadConfig {
         *request.timeout_mut() = None;
         // *request.timeout_mut() = self.config.timeout;
         match self.http_request_configure.as_ref() {
-            None => { request }
-            Some(configure) => {
-                configure(request)
-            }
+            None => request,
+            Some(configure) => configure(request),
         }
     }
 }
@@ -91,7 +94,8 @@ pub struct HttpDownloaderBuilder {
     downloaded_len_send_interval: Option<Duration>,
     chunks_send_interval: Option<Duration>,
     strict_check_accept_ranges: bool,
-    http_request_configure: Option<Box<dyn Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static>>,
+    http_request_configure:
+        Option<Box<dyn Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static>>,
     cancel_token: Option<CancellationToken>,
     handle_redirection: HttpRedirectionHandle,
     use_browser_user_agent: bool,
@@ -120,9 +124,7 @@ impl HttpDownloaderBuilder {
             http_request_configure: None,
             set_len_in_advance: false,
             cancel_token: None,
-            handle_redirection: HttpRedirectionHandle::RequestNewLocation {
-                max_times: 8
-            },
+            handle_redirection: HttpRedirectionHandle::RequestNewLocation { max_times: 8 },
             use_browser_user_agent: true,
         }
     }
@@ -223,21 +225,22 @@ impl HttpDownloaderBuilder {
     }
 
     /// reqwest::Request 配置方法
-    pub fn http_request_configure(mut self, http_request_configure: impl Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static) -> Self {
+    pub fn http_request_configure(
+        mut self,
+        http_request_configure: impl Fn(reqwest::Request) -> reqwest::Request + Send + Sync + 'static,
+    ) -> Self {
         self.http_request_configure = Some(Box::new(http_request_configure));
         self
     }
 
     /// 构建 `ExtendedHttpFileDownloader`
     /// 参数为需要开启的扩展，多个扩展用元组来表示，如果不需要扩展可以传入`()`空元组
-    pub fn build<
-        DEB: DownloadExtensionBuilder,
-    >(
+    pub fn build<DEB: DownloadExtensionBuilder>(
         self,
         extension_builder: DEB,
     ) -> (ExtendedHttpFileDownloader, DEB::ExtensionState) {
         let mut downloader = HttpFileDownloader::new(
-            self.client.unwrap_or(Default::default()),
+            self.client.unwrap_or_default(),
             Arc::new(HttpDownloadConfig {
                 set_len_in_advance: self.set_len_in_advance,
                 download_connection_count: self.download_connection_count,
@@ -263,20 +266,23 @@ impl HttpDownloaderBuilder {
             }),
         );
         let (extension, es) = extension_builder.build(&mut downloader);
-        (ExtendedHttpFileDownloader::new(downloader, Box::new(extension)), es)
+        (
+            ExtendedHttpFileDownloader::new(downloader, Box::new(extension)),
+            es,
+        )
     }
 }
 
 pub trait UrlFileName {
-    fn file_name(&self) -> Cow<str>;
+    fn file_name(&self) -> Cow<'_, str>;
 }
 
 impl UrlFileName for Url {
-    fn file_name(&self) -> Cow<str> {
+    fn file_name(&self) -> Cow<'_, str> {
         let website_default: &'static str = "index.html";
         self.path_segments()
-            .map(|n| {
-                n.last()
+            .map(|mut n| {
+                n.next_back()
                     .map(|n| Cow::Borrowed(if n.is_empty() { website_default } else { n }))
                     .unwrap_or_else(|| {
                         self.domain()

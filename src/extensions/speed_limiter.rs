@@ -3,11 +3,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use futures_util::future::{BoxFuture, OptionFuture};
 use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, OptionFuture};
 use tokio::select;
 
-use crate::{DownloadedLenChangeNotify, DownloaderWrapper, DownloadExtensionBuilder, DownloadFuture, DownloadingState, DownloadStartError, HttpFileDownloader};
+use crate::{
+    DownloadExtensionBuilder, DownloadFuture, DownloadStartError, DownloadedLenChangeNotify,
+    DownloaderWrapper, DownloadingState, HttpFileDownloader,
+};
 
 pub struct DownloadSpeedLimiterExtension<Limiter: SpeedLimiter> {
     limiter: Arc<Limiter>,
@@ -16,16 +19,14 @@ pub struct DownloadSpeedLimiterExtension<Limiter: SpeedLimiter> {
 impl DownloadSpeedLimiterExtension<DefaultSpeedLimiter> {
     pub fn new(byte_count_per: Option<usize>) -> Self {
         Self {
-            limiter: Arc::new(DefaultSpeedLimiter::new(byte_count_per))
+            limiter: Arc::new(DefaultSpeedLimiter::new(byte_count_per)),
         }
     }
 }
 
 impl<Limiter: SpeedLimiter> DownloadSpeedLimiterExtension<Limiter> {
     pub fn from_limiter(limiter: Arc<Limiter>) -> Self {
-        Self {
-            limiter
-        }
+        Self { limiter }
     }
 }
 
@@ -46,7 +47,10 @@ pub struct DownloadSpeedLimiterDownloaderWrapper<Limiter: SpeedLimiter> {
 }
 
 impl<Limiter: SpeedLimiter> DownloaderWrapper for DownloadSpeedLimiterDownloaderWrapper<Limiter> {
-    fn prepare_download(&mut self, downloader: &mut HttpFileDownloader) -> Result<(), DownloadStartError> {
+    fn prepare_download(
+        &mut self,
+        downloader: &mut HttpFileDownloader,
+    ) -> Result<(), DownloadStartError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         downloader.downloaded_len_change_notify = Some(self.limiter.clone());
@@ -54,12 +58,16 @@ impl<Limiter: SpeedLimiter> DownloaderWrapper for DownloadSpeedLimiterDownloader
         self.receiver = Some(receiver);
         Ok(())
     }
-    fn download(&mut self, _downloader: &mut HttpFileDownloader, download_future: DownloadFuture) -> Result<DownloadFuture, DownloadStartError> {
+    fn download(
+        &mut self,
+        _downloader: &mut HttpFileDownloader,
+        download_future: DownloadFuture,
+    ) -> Result<DownloadFuture, DownloadStartError> {
         let receiver = self.receiver.take().unwrap();
 
         let limiter = self.limiter.clone();
         let future = async move {
-            if receiver.await.is_ok(){
+            if receiver.await.is_ok() {
                 limiter.reset().await;
             }
             futures_util::future::pending::<()>().await
@@ -73,7 +81,7 @@ impl<Limiter: SpeedLimiter> DownloaderWrapper for DownloadSpeedLimiterDownloader
                 }
             }
         }
-            .boxed())
+        .boxed())
     }
 }
 
@@ -81,13 +89,18 @@ impl<Limiter: SpeedLimiter> DownloadExtensionBuilder for DownloadSpeedLimiterExt
     type Wrapper = DownloadSpeedLimiterDownloaderWrapper<Limiter>;
     type ExtensionState = DownloadSpeedLimiterState<Limiter>;
 
-    fn build(self, _downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState) where Self: Sized {
+    fn build(self, _downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState)
+    where
+        Self: Sized,
+    {
         (
             DownloadSpeedLimiterDownloaderWrapper {
                 limiter: self.limiter.clone(),
                 receiver: None,
             },
-            DownloadSpeedLimiterState { speed_limiter: self.limiter },
+            DownloadSpeedLimiterState {
+                speed_limiter: self.limiter,
+            },
         )
     }
 }
@@ -101,7 +114,7 @@ pub trait SpeedLimiter: DownloadedLenChangeNotify + 'static {
 
 impl DownloadedLenChangeNotify for DefaultSpeedLimiter {
     #[inline]
-    fn receive_len(&self, len: usize) -> OptionFuture<BoxFuture<()>> {
+    fn receive_len(&self, len: usize) -> OptionFuture<BoxFuture<'_, ()>> {
         let byte_count_per = self.byte_count_per.load(Ordering::Relaxed);
         // 0 表示不限速
         if byte_count_per == 0 {
@@ -113,27 +126,33 @@ impl DownloadedLenChangeNotify for DefaultSpeedLimiter {
             return None.into();
         }
 
-        Some(async move {
-            let mut last_instant = self.last_instant.lock().await;
-            if self.cur_read.load(Ordering::SeqCst) < byte_count_per {
-                return;
+        Some(
+            async move {
+                let mut last_instant = self.last_instant.lock().await;
+                if self.cur_read.load(Ordering::SeqCst) < byte_count_per {
+                    return;
+                }
+                let elapsed_millis = last_instant.elapsed();
+                if elapsed_millis.as_millis() < LIMIT_INTERVAL as u128 {
+                    let duration = Duration::from_millis(LIMIT_INTERVAL) - elapsed_millis;
+                    tokio::time::sleep(duration).await;
+                }
+                *last_instant = Instant::now();
+                self.cur_read.fetch_sub(byte_count_per, Ordering::SeqCst);
             }
-            let elapsed_millis = last_instant.elapsed();
-            if elapsed_millis.as_millis() < LIMIT_INTERVAL as u128 {
-                let duration = Duration::from_millis(LIMIT_INTERVAL) - elapsed_millis;
-                // tracing::info!("sleep duration:{duration:?}");
-                tokio::time::sleep(duration).await;
-            }
-            *last_instant = Instant::now();
-            self.cur_read.fetch_sub(byte_count_per, Ordering::SeqCst);
-        }.boxed()).into()
+            .boxed(),
+        )
+        .into()
     }
 }
 
 #[async_trait::async_trait]
 impl SpeedLimiter for DefaultSpeedLimiter {
     async fn change(&self, byte_count_per: Option<usize>) {
-        self.byte_count_per.store(Self::handle_byte_count_per(byte_count_per), Ordering::Relaxed);
+        self.byte_count_per.store(
+            Self::handle_byte_count_per(byte_count_per),
+            Ordering::Relaxed,
+        );
         self.reset().await;
     }
 
@@ -157,15 +176,15 @@ impl DefaultSpeedLimiter {
     // 0 表示不限速
     pub fn new(byte_count_per: Option<usize>) -> Self {
         Self {
-            byte_count_per: AtomicUsize::new(
-                Self::handle_byte_count_per(byte_count_per)
-            ),
+            byte_count_per: AtomicUsize::new(Self::handle_byte_count_per(byte_count_per)),
             cur_read: Default::default(),
             last_instant: tokio::sync::Mutex::new(Instant::now()),
         }
     }
 
     fn handle_byte_count_per(byte_count_per: Option<usize>) -> usize {
-        byte_count_per.map(|n| ((n as i64) * (LIMIT_INTERVAL as i64 / 1000_i64)) as usize).unwrap_or(0)
+        byte_count_per
+            .map(|n| ((n as i64) * (LIMIT_INTERVAL as i64 / 1000_i64)) as usize)
+            .unwrap_or(0)
     }
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::FutureExt;
@@ -7,7 +7,10 @@ use futures_util::FutureExt;
 use futures_util::Stream;
 use tokio::{select, sync};
 
-use crate::{DownloaderWrapper, DownloadExtensionBuilder, DownloadFuture, DownloadingState, DownloadStartError, DownloadWay, HttpFileDownloader};
+use crate::{
+    DownloadExtensionBuilder, DownloadFuture, DownloadStartError, DownloadWay, DownloaderWrapper,
+    DownloadingState, HttpFileDownloader,
+};
 
 #[derive(Default)]
 pub struct DownloadSpeedTrackerExtension {
@@ -30,7 +33,7 @@ impl DownloadSpeedTrackerState {
     }
 
     #[cfg(feature = "async-stream")]
-    pub fn stream(&self) -> impl Stream<Item=u64> + 'static {
+    pub fn stream(&self) -> impl Stream<Item = u64> + 'static {
         let mut receiver = self.receiver.clone();
         async_stream::stream! {
             let download_speed = *receiver.borrow();
@@ -51,12 +54,14 @@ pub struct DownloadSpeedDownloaderWrapper {
     log: bool,
 }
 
-
 impl DownloadExtensionBuilder for DownloadSpeedTrackerExtension {
     type Wrapper = DownloadSpeedDownloaderWrapper;
     type ExtensionState = DownloadSpeedTrackerState;
 
-    fn build(self, downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState) where Self: Sized {
+    fn build(self, downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState)
+    where
+        Self: Sized,
+    {
         let DownloadSpeedTrackerExtension { log } = self;
         let (sender, receiver) = sync::watch::channel(0);
         let downloaded_len_receiver = downloader.downloaded_len_receiver.clone();
@@ -73,7 +78,10 @@ impl DownloadExtensionBuilder for DownloadSpeedTrackerExtension {
 }
 
 impl DownloaderWrapper for DownloadSpeedDownloaderWrapper {
-    fn prepare_download(&mut self, downloader: &mut HttpFileDownloader) -> Result<(), DownloadStartError> {
+    fn prepare_download(
+        &mut self,
+        downloader: &mut HttpFileDownloader,
+    ) -> Result<(), DownloadStartError> {
         let (sender, download_way_receiver) = sync::oneshot::channel();
         downloader.downloading_state_oneshot_vec.push(sender);
         self.downloading_state_receiver = Some(download_way_receiver);
@@ -87,21 +95,21 @@ impl DownloaderWrapper for DownloadSpeedDownloaderWrapper {
     ) -> Result<DownloadFuture, DownloadStartError> {
         let downloading_state_receiver = self.downloading_state_receiver.take().unwrap();
 
-        let mut downloaded_len_receiver = self.downloaded_len_receiver.clone();
+        let downloaded_len_receiver = self.downloaded_len_receiver.clone();
         let download_speed_sender = self.download_speed_sender.clone();
         let log = self.log;
-
 
         let future = async move {
             let download_way_receiver = downloading_state_receiver
                 .await
                 .map_err(|_| anyhow::Error::msg("ReceiveDownloadWawFailed"))?;
 
-            let mut last_downloaded_len = if let DownloadWay::Ranges(chunk_manager) = &download_way_receiver.download_way {
-                chunk_manager.downloaded_len()
-            } else {
-                0
-            };
+            let mut last_downloaded_len =
+                if let DownloadWay::Ranges(chunk_manager) = &download_way_receiver.download_way {
+                    chunk_manager.downloaded_len()
+                } else {
+                    0
+                };
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let downloaded_len = *downloaded_len_receiver.borrow();
@@ -129,6 +137,7 @@ impl DownloaderWrapper for DownloadSpeedDownloaderWrapper {
                     r
                 }
             }
-        }.boxed())
+        }
+        .boxed())
     }
 }

@@ -1,16 +1,20 @@
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
-use futures_util::future::{BoxFuture};
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use tokio::{select, sync};
 
-use crate::{BreakpointResume, ChunkInfo, ChunkRange, DownloadArchiveData, DownloaderWrapper, DownloadExtensionBuilder, DownloadFuture, DownloadingState, DownloadStartError, DownloadWay, HttpDownloadConfig, HttpFileDownloader};
 use crate::exclusive::Exclusive;
+use crate::{
+    BreakpointResume, ChunkInfo, ChunkRange, DownloadArchiveData, DownloadExtensionBuilder,
+    DownloadFuture, DownloadStartError, DownloadWay, DownloaderWrapper, DownloadingState,
+    HttpDownloadConfig, HttpFileDownloader,
+};
 
 pub enum FileSave {
     AbsolutePath(PathBuf),
@@ -18,19 +22,19 @@ pub enum FileSave {
 }
 
 impl FileSave {
-    pub fn get_file_path(&self, origin_file: &Path) -> Cow<PathBuf> {
+    pub fn get_file_path(&self, origin_file: &Path) -> Cow<'_, PathBuf> {
         match self {
             FileSave::AbsolutePath(path) => Cow::Borrowed(path),
-            FileSave::OriginPathWithSuffix(suffix) => Cow::Owned(
-                origin_file.with_extension(OsStr::new(&format!(
+            FileSave::OriginPathWithSuffix(suffix) => {
+                Cow::Owned(origin_file.with_extension(OsStr::new(&format!(
                     "{}.{}",
                     origin_file
                         .extension()
                         .and_then(|n| n.to_str())
                         .unwrap_or(""),
                     suffix
-                ))),
-            ),
+                ))))
+            }
         }
     }
 }
@@ -40,17 +44,17 @@ pub struct DownloadBreakpointResumeExtension<T: DownloadDataArchiverBuilder> {
 }
 
 impl<T: DownloadDataArchiverBuilder> DownloadBreakpointResumeExtension<T> {
-    pub fn new(download_archiver_builder:T)->Self{
-        Self{
-            download_archiver_builder
+    pub fn new(download_archiver_builder: T) -> Self {
+        Self {
+            download_archiver_builder,
         }
     }
 }
 
 pub trait DownloadDataArchiver: Send + Sync + 'static {
-    fn save(&self, data: Box<DownloadArchiveData>) -> BoxFuture<'static,Result<()>>;
-    fn load(&self) -> BoxFuture<'static,Result<Option<Box<DownloadArchiveData>>>>;
-    fn clear(&self){}
+    fn save(&self, data: Box<DownloadArchiveData>) -> BoxFuture<'static, Result<()>>;
+    fn load(&self) -> BoxFuture<'static, Result<Option<Box<DownloadArchiveData>>>>;
+    fn clear(&self) {}
 }
 
 pub trait DownloadDataArchiverBuilder {
@@ -68,11 +72,16 @@ pub struct DownloadBreakpointResumeDownloaderWrapper<T: DownloadDataArchiverBuil
     pub receiver: Option<sync::oneshot::Receiver<Arc<DownloadingState>>>,
 }
 
-impl<T: DownloadDataArchiverBuilder + 'static> DownloadExtensionBuilder for DownloadBreakpointResumeExtension<T> {
+impl<T: DownloadDataArchiverBuilder + 'static> DownloadExtensionBuilder
+    for DownloadBreakpointResumeExtension<T>
+{
     type Wrapper = DownloadBreakpointResumeDownloaderWrapper<T>;
     type ExtensionState = DownloadBreakpointResumeState<T>;
 
-    fn build(self, downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState) where Self: Sized {
+    fn build(self, downloader: &mut HttpFileDownloader) -> (Self::Wrapper, Self::ExtensionState)
+    where
+        Self: Sized,
+    {
         let DownloadBreakpointResumeExtension {
             download_archiver_builder,
         } = self;
@@ -84,16 +93,18 @@ impl<T: DownloadDataArchiverBuilder + 'static> DownloadExtensionBuilder for Down
                 breakpoint_resume: None,
                 receiver: None,
             },
-            DownloadBreakpointResumeState {
-                download_archiver,
-            },
+            DownloadBreakpointResumeState { download_archiver },
         )
     }
 }
 
-impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper for DownloadBreakpointResumeDownloaderWrapper<T>
+impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper
+    for DownloadBreakpointResumeDownloaderWrapper<T>
 {
-    fn prepare_download(&mut self, downloader: &mut HttpFileDownloader) -> Result<(), DownloadStartError> {
+    fn prepare_download(
+        &mut self,
+        downloader: &mut HttpFileDownloader,
+    ) -> Result<(), DownloadStartError> {
         let (sender, receiver) = sync::oneshot::channel();
 
         downloader.breakpoint_resume = Some(Arc::new(BreakpointResume::default()));
@@ -108,8 +119,7 @@ impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper for DownloadBre
         &mut self,
         downloader: &mut HttpFileDownloader,
         download_future: DownloadFuture,
-    ) -> Result<DownloadFuture, DownloadStartError>
-    {
+    ) -> Result<DownloadFuture, DownloadStartError> {
         let notifies = self.breakpoint_resume.as_ref().unwrap().clone();
         let receiver = self.receiver.take().unwrap();
         let cancel_token = downloader.cancel_token.clone();
@@ -133,7 +143,7 @@ impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper for DownloadBre
                             data.clone()
                         };
                         let downloading_chunks = chunk_manager.get_chunks().await;
-                        if cancel_token.is_cancelled(){
+                        if cancel_token.is_cancelled() {
                             data.last_incomplete_chunks.extend(
                                 downloading_chunks.iter().filter_map(|n| {
                                     let downloaded_len = n.downloaded_len.load(Ordering::SeqCst);
@@ -149,14 +159,17 @@ impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper for DownloadBre
                                     }
                                 }),
                             );
-                        }else{
-                            data.remaining.ranges.extend(downloading_chunks.into_iter().map(|n|n.chunk_info.range));
-                            data.remaining.ranges.sort_by_key(|n|n.start);
+                        } else {
+                            data.remaining
+                                .ranges
+                                .extend(downloading_chunks.into_iter().map(|n| n.chunk_info.range));
+                            data.remaining.ranges.sort_by_key(|n| n.start);
                         }
                         let archive_data = DownloadArchiveData {
                             downloaded_len: chunk_manager.chunk_iterator.content_length
                                 - data.remaining_len(),
-                            downloading_duration: downloading_state.get_current_downloading_duration(),
+                            downloading_duration: downloading_state
+                                .get_current_downloading_duration(),
                             chunk_data: Some(data),
                         };
                         download_archiver.save(Box::new(archive_data)).await?;
@@ -179,6 +192,6 @@ impl<T: DownloadDataArchiverBuilder + 'static> DownloaderWrapper for DownloadBre
                 }
             }
         }
-            .boxed())
+        .boxed())
     }
 }
